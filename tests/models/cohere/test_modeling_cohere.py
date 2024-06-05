@@ -14,6 +14,10 @@
 # limitations under the License.
 """Testing suite for the PyTorch Cohere model."""
 
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+
+
 import unittest
 
 from transformers import CohereConfig, is_torch_available
@@ -292,8 +296,6 @@ class CohereModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMix
         self.config_tester = ConfigTester(self, config_class=CohereConfig, hidden_size=37)
 
     def test_eager_matches_sdpa_generate(self):
-        import os
-        os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
         super().test_eager_matches_sdpa_generate()
 
     @unittest.skip("foo")

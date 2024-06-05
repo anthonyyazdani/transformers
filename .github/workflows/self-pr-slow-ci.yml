@@ -115,7 +115,7 @@ jobs:
 
       - name: Run all tests on GPU
         working-directory: /transformers
-        run: python3 -m pytest -v -rsfE --make-reports=${{ matrix.machine_type }}_run_models_gpu_${{ matrix.folders }}_test_reports tests/models/cohere/test_tokenization_cohere.py::CohereTokenizationTest::test_torch_encode_plus_sent_to_model 
+        run: CUDA_VISIBLE_DEVICES="" python3 -m pytest -v -rsfE --make-reports=${{ matrix.machine_type }}_run_models_gpu_${{ matrix.folders }}_test_reports tests/${{ matrix.folders }}
 
       - name: Failure short reports
         if: ${{ failure() }}

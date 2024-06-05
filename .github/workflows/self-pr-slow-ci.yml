@@ -71,6 +71,11 @@ jobs:
         image: huggingface/transformers-all-latest-gpu
         options: --gpus all --shm-size "16gb" --ipc host -v /mnt/cache/.cache/huggingface:/mnt/cache/
       steps:
+      - name: Echo
+        shell: bash
+        run: |
+          free -g
+
       - name: Echo input and matrix info
         shell: bash
         run: |

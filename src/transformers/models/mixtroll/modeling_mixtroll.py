@@ -766,7 +766,7 @@ class MixtrollSdpaAttention(MixtrollAttention):
         return attn_output, None, past_key_value
 
 
-MIXTRAL_ATTENTION_CLASSES = {
+MIXTROLL_ATTENTION_CLASSES = {
     "eager": MixtrollAttention,
     "flash_attention_2": MixtrollFlashAttention2,
     "sdpa": MixtrollSdpaAttention,
@@ -849,9 +849,6 @@ class MixtrollSparseMoeBlock(nn.Module):
             final_hidden_states = torch.zeros((batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device)
             expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
 
-            # Store RDMs for each expert
-            rdms = {}
-
             # Compute full representations for all experts
             full_expert_representations = {}
             for expert_idx in range(self.num_experts):
@@ -859,11 +856,12 @@ class MixtrollSparseMoeBlock(nn.Module):
                 full_expert_representations[expert_idx] = expert_layer(hidden_states)
 
             # Compute RDMs for all experts
-            for expert_idx, representations in full_expert_representations.items():
-                if sequence_length > 1:
-                    rdms[expert_idx] = self.compute_upper_triu_corr(representations)
-                else:
-                    rdms[expert_idx] = None
+            if sequence_length > 1:
+                rdms = {}
+                for expert_idx, representations in full_expert_representations.items():
+                        rdms[expert_idx] = self.compute_upper_triu_corr(representations)
+            else:
+                rdms = None
 
             # Use only the top_k experts for final_hidden_states
             for expert_idx in range(self.num_experts):
@@ -876,6 +874,7 @@ class MixtrollSparseMoeBlock(nn.Module):
             final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
 
             return final_hidden_states, router_logits, rdms
+        
         else:
             batch_size, sequence_length, hidden_dim = hidden_states.shape
             if self.training and self.jitter_noise > 0:
@@ -921,7 +920,7 @@ class MixtrollDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.self_attn = MIXTRAL_ATTENTION_CLASSES[config._attn_implementation](config, layer_idx)
+        self.self_attn = MIXTROLL_ATTENTION_CLASSES[config._attn_implementation](config, layer_idx)
 
         self.block_sparse_moe = MixtrollSparseMoeBlock(config)
         self.input_layernorm = MixtrollRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -995,7 +994,7 @@ class MixtrollDecoderLayer(nn.Module):
         return outputs
 
 
-MIXTRAL_START_DOCSTRING = r"""
+MIXTROLL_START_DOCSTRING = r"""
     This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
     library implements for all its model (such as downloading or saving, resizing the input embeddings, pruning heads
     etc.)
@@ -1014,7 +1013,7 @@ MIXTRAL_START_DOCSTRING = r"""
 
 @add_start_docstrings(
     "The bare Mixtroll Model outputting raw hidden-states without any specific head on top.",
-    MIXTRAL_START_DOCSTRING,
+    MIXTROLL_START_DOCSTRING,
 )
 # Copied from transformers.models.mistral.modeling_mistral.MistralPreTrainedModel with Mistral->Mixtroll
 class MixtrollPreTrainedModel(PreTrainedModel):
@@ -1039,7 +1038,7 @@ class MixtrollPreTrainedModel(PreTrainedModel):
                 module.weight.data[module.padding_idx].zero_()
 
 
-MIXTRAL_INPUTS_DOCSTRING = r"""
+MIXTROLL_INPUTS_DOCSTRING = r"""
     Args:
         input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
             Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you provide
@@ -1108,9 +1107,9 @@ MIXTRAL_INPUTS_DOCSTRING = r"""
 
 @add_start_docstrings(
     "The bare Mixtroll Model outputting raw hidden-states without any specific head on top.",
-    MIXTRAL_START_DOCSTRING,
+    MIXTROLL_START_DOCSTRING,
 )
-# Copied from transformers.models.mistral.modeling_mistral.MistralModel with MISTRAL->MIXTRAL,Mistral->Mixtroll
+# Copied from transformers.models.mistral.modeling_mistral.MistralModel with MISTRAL->MIXTROLL,Mistral->Mixtroll
 class MixtrollModel(MixtrollPreTrainedModel):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`MixtrollDecoderLayer`]
@@ -1142,7 +1141,7 @@ class MixtrollModel(MixtrollPreTrainedModel):
         self.embed_tokens = value
 
     # Ignore copy
-    @add_start_docstrings_to_model_forward(MIXTRAL_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(MIXTROLL_INPUTS_DOCSTRING)
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -1156,7 +1155,7 @@ class MixtrollModel(MixtrollPreTrainedModel):
         output_router_logits: Optional[bool] = None,
         output_rdms: Optional[bool] = True,
         return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, MoeModelOutputWithPast]:
+    ) -> Union[Tuple, OllModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_router_logits = (
             output_router_logits if output_router_logits is not None else self.config.output_router_logits
@@ -1310,7 +1309,7 @@ class MixtrollModel(MixtrollPreTrainedModel):
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
             router_logits=all_router_logits,
-            representational_similarity_matrices=all_rdms,
+            rdms=all_rdms,
         )
 
 
@@ -1346,7 +1345,7 @@ class MixtrollForCausalLM(MixtrollPreTrainedModel):
     def get_decoder(self):
         return self.model
 
-    @add_start_docstrings_to_model_forward(MIXTRAL_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(MIXTROLL_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=OllCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     # Ignore copy
     def forward(
@@ -1550,9 +1549,9 @@ class MixtrollForCausalLM(MixtrollPreTrainedModel):
     padding tokens when `inputs_embeds` are passed instead of `input_ids`, it does the same (take the last value in
     each row of the batch).
     """,
-    MIXTRAL_START_DOCSTRING,
+    MIXTROLL_START_DOCSTRING,
 )
-# Copied from transformers.models.llama.modeling_llama.LlamaForSequenceClassification with Llama->Mixtroll, LLAMA->MIXTRAL
+# Copied from transformers.models.llama.modeling_llama.LlamaForSequenceClassification with Llama->Mixtroll, LLAMA->MIXTROLL
 class MixtrollForSequenceClassification(MixtrollPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
@@ -1569,7 +1568,7 @@ class MixtrollForSequenceClassification(MixtrollPreTrainedModel):
     def set_input_embeddings(self, value):
         self.model.embed_tokens = value
 
-    @add_start_docstrings_to_model_forward(MIXTRAL_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(MIXTROLL_INPUTS_DOCSTRING)
     def forward(
         self,
         input_ids: torch.LongTensor = None,

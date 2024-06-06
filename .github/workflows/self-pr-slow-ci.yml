@@ -111,7 +111,7 @@ jobs:
       - name: Run all tests on GPU
         working-directory: /transformers
         run: |
-          echo "devices=$(python3 -c 'temp7.py')" >> $GITHUB_ENV
+          echo "devices=$(python3 temp7.py)" >> $GITHUB_ENV
           CUDA_VISIBLE_DEVICES=${{ env.devices }} python3 -m pytest -v -rsfE --make-reports=${{ matrix.machine_type }}_run_models_gpu_${{ matrix.folders }}_test_reports tests/${{ matrix.folders }}
 
       - name: Failure short reports

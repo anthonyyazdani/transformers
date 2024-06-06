@@ -17,6 +17,9 @@
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 
+import importlib
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+
 
 import unittest
 
@@ -40,6 +43,8 @@ if is_torch_available():
     import torch
 
     from transformers import AutoTokenizer, CohereForCausalLM, CohereModel
+
+torch = importlib.reload(torch)
 
 
 # Copied from transformers.tests.models.llama.LlamaModelTester with Llama->Cohere

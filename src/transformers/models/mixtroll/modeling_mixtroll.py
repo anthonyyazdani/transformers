@@ -35,8 +35,8 @@ from ...modeling_attn_mask_utils import (
     _prepare_4d_causal_attention_mask_for_sdpa,
 )
 from ...modeling_outputs import (
-    MoeCausalLMOutputWithPast,
-    MoeModelOutputWithPast,
+    OllCausalLMOutputWithPast,
+    OllModelOutputWithPast,
     SequenceClassifierOutputWithPast,
 )
 from ...modeling_utils import PreTrainedModel
@@ -818,45 +818,102 @@ class MixtrollSparseMoeBlock(nn.Module):
         # Jitter parameters
         self.jitter_noise = config.router_jitter_noise
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """ """
-        batch_size, sequence_length, hidden_dim = hidden_states.shape
-        if self.training and self.jitter_noise > 0:
-            hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
-        hidden_states = hidden_states.view(-1, hidden_dim)
-        # router_logits: (batch * sequence_length, n_experts)
-        router_logits = self.gate(hidden_states)
+    def compute_upper_triu_corr(self, representations: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the correlation matrix and extract the upper triangle (without main diagonal).
 
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        # we cast back to the input dtype
-        routing_weights = routing_weights.to(hidden_states.dtype)
+        Args:
+            representations (Tensor): A tensor of shape (num_tokens, num_features).
 
-        final_hidden_states = torch.zeros(
-            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
-        )
+        Returns:
+            Tensor: A flattened tensor containing the upper triangle (without main diagonal) of the correlation matrix.
+        """
+        correlation_matrix = torch.corrcoef(representations)
+        upper_triu_indices = torch.triu_indices(correlation_matrix.size(0), correlation_matrix.size(1), offset=1)
+        upper_triu_values = correlation_matrix[upper_triu_indices[0], upper_triu_indices[1]]
+        return upper_triu_values
 
-        # One hot encode the selected experts to create an expert mask
-        # this will be used to easily index which expert is going to be sollicitated
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+    def forward(self, hidden_states: torch.Tensor):
+        if self.training:
+            batch_size, sequence_length, hidden_dim = hidden_states.shape
+            if self.training and self.jitter_noise > 0:
+                hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
+            hidden_states = hidden_states.view(-1, hidden_dim)
+            router_logits = self.gate(hidden_states)
 
-        # Loop over all available experts in the model and perform the computation on each expert
-        for expert_idx in range(self.num_experts):
-            expert_layer = self.experts[expert_idx]
-            idx, top_x = torch.where(expert_mask[expert_idx])
+            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+            routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+            routing_weights = routing_weights.to(hidden_states.dtype)
 
-            # Index the correct hidden states and compute the expert hidden state for
-            # the current expert. We need to make sure to multiply the output hidden
-            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
-            current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
+            final_hidden_states = torch.zeros((batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device)
+            expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
 
-            # However `index_add_` only support torch tensors for indexing so we'll use
-            # the `top_x` tensor here.
-            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
-        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-        return final_hidden_states, router_logits
+            # Store RDMs for each expert
+            rdms = {}
+
+            # Compute full representations for all experts
+            full_expert_representations = {}
+            for expert_idx in range(self.num_experts):
+                expert_layer = self.experts[expert_idx]
+                full_expert_representations[expert_idx] = expert_layer(hidden_states)
+
+            # Compute RDMs for all experts
+            for expert_idx, representations in full_expert_representations.items():
+                if sequence_length > 1:
+                    rdms[expert_idx] = self.compute_upper_triu_corr(representations)
+                else:
+                    rdms[expert_idx] = None
+
+            # Use only the top_k experts for final_hidden_states
+            for expert_idx in range(self.num_experts):
+                idx, top_x = torch.where(expert_mask[expert_idx])
+
+                if top_x.numel() > 0:
+                    current_hidden_states = full_expert_representations[expert_idx][top_x] * routing_weights[top_x, idx].unsqueeze(-1)
+                    final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+
+            final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+
+            return final_hidden_states, router_logits, rdms
+        else:
+            batch_size, sequence_length, hidden_dim = hidden_states.shape
+            if self.training and self.jitter_noise > 0:
+                hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
+            hidden_states = hidden_states.view(-1, hidden_dim)
+            # router_logits: (batch * sequence_length, n_experts)
+            router_logits = self.gate(hidden_states)
+
+            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+            routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+            # we cast back to the input dtype
+            routing_weights = routing_weights.to(hidden_states.dtype)
+
+            final_hidden_states = torch.zeros(
+                (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+            )
+
+            # One hot encode the selected experts to create an expert mask
+            # this will be used to easily index which expert is going to be sollicitated
+            expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+
+            # Loop over all available experts in the model and perform the computation on each expert
+            for expert_idx in range(self.num_experts):
+                expert_layer = self.experts[expert_idx]
+                idx, top_x = torch.where(expert_mask[expert_idx])
+
+                # Index the correct hidden states and compute the expert hidden state for
+                # the current expert. We need to make sure to multiply the output hidden
+                # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
+                current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
+                current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
+
+                # However `index_add_` only support torch tensors for indexing so we'll use
+                # the `top_x` tensor here.
+                final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+            final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+            return final_hidden_states, router_logits, None
 
 
 class MixtrollDecoderLayer(nn.Module):
@@ -878,6 +935,7 @@ class MixtrollDecoderLayer(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         output_router_logits: Optional[bool] = False,
+        output_rdms: Optional[bool] = True,
         use_cache: Optional[bool] = False,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
@@ -892,6 +950,8 @@ class MixtrollDecoderLayer(nn.Module):
             output_router_logits (`bool`, *optional*):
                 Whether or not to return the logits of all the routers. They are useful for computing the router loss, and
                 should not be returned during inference.
+            output_rdms (`bool`, *optional*):
+                Whether or not to return the rdms. They are useful for computing the oll loss.
             use_cache (`bool`, *optional*):
                 If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
                 (see `past_key_values`).
@@ -915,7 +975,7 @@ class MixtrollDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states, router_logits = self.block_sparse_moe(hidden_states)
+        hidden_states, router_logits, rdms = self.block_sparse_moe(hidden_states)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -928,6 +988,9 @@ class MixtrollDecoderLayer(nn.Module):
 
         if output_router_logits:
             outputs += (router_logits,)
+
+        if output_rdms:
+            outputs += (rdms,)
 
         return outputs
 
@@ -1091,6 +1154,7 @@ class MixtrollModel(MixtrollPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
+        output_rdms: Optional[bool] = True,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, MoeModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -1179,6 +1243,7 @@ class MixtrollModel(MixtrollPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         all_router_logits = () if output_router_logits else None
+        all_rdms = () if output_rdms else None
         next_decoder_cache = None
 
         for decoder_layer in self.layers:
@@ -1195,6 +1260,7 @@ class MixtrollModel(MixtrollPreTrainedModel):
                     output_attentions,
                     output_router_logits,
                     use_cache,
+                    output_rdms=output_rdms,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -1204,6 +1270,7 @@ class MixtrollModel(MixtrollPreTrainedModel):
                     past_key_value=past_key_values,
                     output_attentions=output_attentions,
                     output_router_logits=output_router_logits,
+                    output_rdms=output_rdms,
                     use_cache=use_cache,
                 )
 
@@ -1216,7 +1283,10 @@ class MixtrollModel(MixtrollPreTrainedModel):
                 all_self_attns += (layer_outputs[1],)
 
             if output_router_logits:
-                all_router_logits += (layer_outputs[-1],)
+                all_router_logits += (layer_outputs[-2],)
+
+            if output_rdms:
+                all_rdms += (layer_outputs[-1],)
 
         hidden_states = self.norm(hidden_states)
 
@@ -1231,15 +1301,16 @@ class MixtrollModel(MixtrollPreTrainedModel):
         if not return_dict:
             return tuple(
                 v
-                for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, all_router_logits]
+                for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, all_router_logits, all_rdms]
                 if v is not None
             )
-        return MoeModelOutputWithPast(
+        return OllModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
             router_logits=all_router_logits,
+            representational_similarity_matrices=all_rdms,
         )
 
 
@@ -1276,7 +1347,7 @@ class MixtrollForCausalLM(MixtrollPreTrainedModel):
         return self.model
 
     @add_start_docstrings_to_model_forward(MIXTRAL_INPUTS_DOCSTRING)
-    @replace_return_docstrings(output_type=MoeCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
+    @replace_return_docstrings(output_type=OllCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     # Ignore copy
     def forward(
         self,
@@ -1290,8 +1361,9 @@ class MixtrollForCausalLM(MixtrollPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
+        output_rdms: Optional[bool] = True,
         return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, MoeCausalLMOutputWithPast]:
+    ) -> Union[Tuple, OllCausalLMOutputWithPast]:
         r"""
         Args:
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -1322,6 +1394,9 @@ class MixtrollForCausalLM(MixtrollPreTrainedModel):
         output_router_logits = (
             output_router_logits if output_router_logits is not None else self.config.output_router_logits
         )
+        output_rdms = (
+            output_rdms if output_rdms is not None else False
+        )
 
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1339,6 +1414,7 @@ class MixtrollForCausalLM(MixtrollPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
+            output_rdms=output_rdms,
             return_dict=return_dict,
         )
 
@@ -1376,7 +1452,7 @@ class MixtrollForCausalLM(MixtrollPreTrainedModel):
                 output = (aux_loss,) + output
             return (loss,) + output if loss is not None else output
 
-        return MoeCausalLMOutputWithPast(
+        return OllCausalLMOutputWithPast(
             loss=loss,
             aux_loss=aux_loss,
             logits=logits,
@@ -1384,6 +1460,7 @@ class MixtrollForCausalLM(MixtrollPreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             router_logits=outputs.router_logits,
+            rdms=outputs.rdms,
         )
 
     def prepare_inputs_for_generation(

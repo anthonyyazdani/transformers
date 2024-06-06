@@ -529,6 +529,7 @@ _import_structure = {
     ],
     "models.mistral": ["MistralConfig"],
     "models.mixtral": ["MixtralConfig"],
+    "models.mixtroll": ["MixtralConfig"],
     "models.mluke": [],
     "models.mobilebert": [
         "MobileBertConfig",
@@ -2441,6 +2442,9 @@ else:
     )
     _import_structure["models.mixtral"].extend(
         ["MixtralForCausalLM", "MixtralForSequenceClassification", "MixtralModel", "MixtralPreTrainedModel"]
+    )
+    _import_structure["models.mixtroll"].extend(
+        ["MixtrollForCausalLM", "MixtrollForSequenceClassification", "MixtrollModel", "MixtrollPreTrainedModel"]
     )
     _import_structure["models.mobilebert"].extend(
         [
@@ -5082,6 +5086,7 @@ if TYPE_CHECKING:
     )
     from .models.mistral import MistralConfig
     from .models.mixtral import MixtralConfig
+    from .models.mixtroll import MixtrollConfig
     from .models.mobilebert import (
         MobileBertConfig,
         MobileBertTokenizer,
@@ -6809,6 +6814,12 @@ if TYPE_CHECKING:
             MixtralForSequenceClassification,
             MixtralModel,
             MixtralPreTrainedModel,
+        )
+        from .models.mixtroll import (
+            MixtrollForCausalLM,
+            MixtrollForSequenceClassification,
+            MixtrollModel,
+            MixtrollPreTrainedModel,
         )
         from .models.mobilebert import (
             MobileBertForMaskedLM,

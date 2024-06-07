@@ -792,16 +792,6 @@ class MixtrollBlockSparseTop2MLP(nn.Module):
 
 
 class MixtrollSparseMoeBlock(nn.Module):
-    """
-    This implementation is
-    strictly equivalent to standard MoE with full capacity (no
-    dropped tokens). It's faster since it formulates MoE operations
-    in terms of block-sparse operations to accomodate imbalanced
-    assignments of tokens to experts, whereas standard MoE either
-    (1) drop tokens at the cost of reduced performance or (2) set
-    capacity factor to number of experts and thus waste computation
-    and memory on padding.
-    """
 
     def __init__(self, config):
         super().__init__()
@@ -809,110 +799,52 @@ class MixtrollSparseMoeBlock(nn.Module):
         self.ffn_dim = config.intermediate_size
         self.num_experts = config.num_local_experts
         self.top_k = config.num_experts_per_tok
-
-        # gating
         self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
-
         self.experts = nn.ModuleList([MixtrollBlockSparseTop2MLP(config) for _ in range(self.num_experts)])
-
-        # Jitter parameters
         self.jitter_noise = config.router_jitter_noise
 
     def compute_upper_triu_corr(self, representations: torch.Tensor) -> torch.Tensor:
-        """
-        Compute the correlation matrix and extract the upper triangle (without main diagonal).
-
-        Args:
-            representations (Tensor): A tensor of shape (num_tokens, num_features).
-
-        Returns:
-            Tensor: A flattened tensor containing the upper triangle (without main diagonal) of the correlation matrix.
-        """
         correlation_matrix = torch.corrcoef(representations)
         upper_triu_indices = torch.triu_indices(correlation_matrix.size(0), correlation_matrix.size(1), offset=1)
         upper_triu_values = correlation_matrix[upper_triu_indices[0], upper_triu_indices[1]]
         return upper_triu_values
 
     def forward(self, hidden_states: torch.Tensor):
-        if self.training:
-            batch_size, sequence_length, hidden_dim = hidden_states.shape
-            if self.training and self.jitter_noise > 0:
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+
+        if self.training and self.jitter_noise > 0:
                 hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
-            hidden_states = hidden_states.view(-1, hidden_dim)
-            router_logits = self.gate(hidden_states)
 
-            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-            routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-            routing_weights = routing_weights.to(hidden_states.dtype)
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        router_logits = self.gate(hidden_states)
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights = routing_weights.to(hidden_states.dtype)
+        final_hidden_states = torch.zeros((batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device)
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
 
-            final_hidden_states = torch.zeros((batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device)
-            expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+        rdms = None
 
-            # Compute full representations for all experts
-            full_expert_representations = {}
-            for expert_idx in range(self.num_experts):
-                expert_layer = self.experts[expert_idx]
-                full_expert_representations[expert_idx] = expert_layer(hidden_states)
-
-            # Compute RDMs for all experts
-            if sequence_length > 1:
-                rdms = {}
-                for expert_idx, representations in full_expert_representations.items():
-                        rdms[expert_idx] = self.compute_upper_triu_corr(representations)
-            else:
-                rdms = None
-
-            # Use only the top_k experts for final_hidden_states
+        if self.training and sequence_length > 1:
+            full_expert_representations = {expert_idx: expert_layer(hidden_states) for expert_idx, expert_layer in enumerate(self.experts)}
+            rdms = torch.stack([self.compute_upper_triu_corr(representations) for representations in full_expert_representations.values()])
             for expert_idx in range(self.num_experts):
                 idx, top_x = torch.where(expert_mask[expert_idx])
-
                 if top_x.numel() > 0:
-                    current_hidden_states = full_expert_representations[expert_idx][top_x] * routing_weights[top_x, idx].unsqueeze(-1)
+                    current_hidden_states = full_expert_representations[expert_idx][top_x] * routing_weights[top_x, idx, None]
                     final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
-
-            final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-
-            return final_hidden_states, router_logits, rdms
-        
         else:
-            batch_size, sequence_length, hidden_dim = hidden_states.shape
-            if self.training and self.jitter_noise > 0:
-                hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
-            hidden_states = hidden_states.view(-1, hidden_dim)
-            # router_logits: (batch * sequence_length, n_experts)
-            router_logits = self.gate(hidden_states)
-
-            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-            routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-            # we cast back to the input dtype
-            routing_weights = routing_weights.to(hidden_states.dtype)
-
-            final_hidden_states = torch.zeros(
-                (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
-            )
-
-            # One hot encode the selected experts to create an expert mask
-            # this will be used to easily index which expert is going to be sollicitated
-            expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
-
-            # Loop over all available experts in the model and perform the computation on each expert
             for expert_idx in range(self.num_experts):
                 expert_layer = self.experts[expert_idx]
                 idx, top_x = torch.where(expert_mask[expert_idx])
-
-                # Index the correct hidden states and compute the expert hidden state for
-                # the current expert. We need to make sure to multiply the output hidden
-                # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
                 current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
                 current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
-
-                # However `index_add_` only support torch tensors for indexing so we'll use
-                # the `top_x` tensor here.
                 final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
-            final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-            return final_hidden_states, router_logits, None
+
+        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+
+        return final_hidden_states, router_logits, rdms
 
 
 class MixtrollDecoderLayer(nn.Module):

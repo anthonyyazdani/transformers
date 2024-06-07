@@ -792,7 +792,6 @@ class MixtrollBlockSparseTop2MLP(nn.Module):
 
 
 class MixtrollSparseMoeBlock(nn.Module):
-
     def __init__(self, config):
         super().__init__()
         self.hidden_dim = config.hidden_size
@@ -809,11 +808,11 @@ class MixtrollSparseMoeBlock(nn.Module):
         upper_triu_values = correlation_matrix[upper_triu_indices[0], upper_triu_indices[1]]
         return upper_triu_values
 
-    def forward(self, hidden_states: torch.Tensor):
+    def forward(self, hidden_states: torch.Tensor, output_rdms: bool = False):
         batch_size, sequence_length, hidden_dim = hidden_states.shape
 
         if self.training and self.jitter_noise > 0:
-                hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
+            hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
 
         hidden_states = hidden_states.view(-1, hidden_dim)
         router_logits = self.gate(hidden_states)
@@ -826,7 +825,7 @@ class MixtrollSparseMoeBlock(nn.Module):
 
         rdms = None
 
-        if self.training and sequence_length > 1:
+        if output_rdms and sequence_length > 1:
             full_expert_representations = {expert_idx: expert_layer(hidden_states) for expert_idx, expert_layer in enumerate(self.experts)}
             rdms = torch.stack([self.compute_upper_triu_corr(representations) for representations in full_expert_representations.values()])
             for expert_idx in range(self.num_experts):
@@ -866,7 +865,7 @@ class MixtrollDecoderLayer(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         output_router_logits: Optional[bool] = False,
-        output_rdms: Optional[bool] = True,
+        output_rdms: Optional[bool] = False,
         use_cache: Optional[bool] = False,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
@@ -906,7 +905,7 @@ class MixtrollDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states, router_logits, rdms = self.block_sparse_moe(hidden_states)
+        hidden_states, router_logits, rdms = self.block_sparse_moe(hidden_states, output_rdms=output_rdms)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -1085,7 +1084,7 @@ class MixtrollModel(MixtrollPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
-        output_rdms: Optional[bool] = True,
+        output_rdms: Optional[bool] = False,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, OllModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -1292,7 +1291,7 @@ class MixtrollForCausalLM(MixtrollPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
-        output_rdms: Optional[bool] = True,
+        output_rdms: Optional[bool] = False,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, OllCausalLMOutputWithPast]:
         r"""

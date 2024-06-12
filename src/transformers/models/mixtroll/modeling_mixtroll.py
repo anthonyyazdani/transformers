@@ -802,10 +802,15 @@ class MixtrollSparseMoeBlock(nn.Module):
         self.experts = nn.ModuleList([MixtrollBlockSparseTop2MLP(config) for _ in range(self.num_experts)])
         self.jitter_noise = config.router_jitter_noise
 
-    def compute_upper_triu_corr(self, representations: torch.Tensor) -> torch.Tensor:
-        correlation_matrix = torch.corrcoef(representations)
-        upper_triu_indices = torch.triu_indices(correlation_matrix.size(0), correlation_matrix.size(1), offset=1)
-        upper_triu_values = correlation_matrix[upper_triu_indices[0], upper_triu_indices[1]]
+    @staticmethod
+    def batch_corrcoef(input: torch.Tensor) -> torch.Tensor:
+        standardized_tensor = (input - input.mean(dim=-1, keepdim=True)) / input.std(dim=-1, unbiased=True, keepdim=True)
+        return torch.bmm(standardized_tensor, standardized_tensor.transpose(1, 2)) / (input.shape[-1] - 1)
+    
+    def upper_triu_batch_corrcoef(self, input: torch.Tensor) -> torch.Tensor:
+        batch_corr = self.batch_corrcoef(input)
+        triu_ids = torch.triu_indices(batch_corr.size(-2), batch_corr.size(-1), offset=1)
+        upper_triu_values = batch_corr[..., triu_ids[0], triu_ids[1]]
         return upper_triu_values
 
     def forward(self, hidden_states: torch.Tensor, output_rdms: bool = False):
@@ -827,7 +832,7 @@ class MixtrollSparseMoeBlock(nn.Module):
 
         if output_rdms and sequence_length > 1:
             full_expert_representations = {expert_idx: expert_layer(hidden_states) for expert_idx, expert_layer in enumerate(self.experts)}
-            rdms = torch.stack([self.compute_upper_triu_corr(representations) for representations in full_expert_representations.values()])
+            rdms = torch.stack([self.upper_triu_batch_corrcoef(representations.view(batch_size, sequence_length, hidden_dim)) for representations in full_expert_representations.values()])
             for expert_idx in range(self.num_experts):
                 idx, top_x = torch.where(expert_mask[expert_idx])
                 if top_x.numel() > 0:
